@@ -987,6 +987,8 @@ function storeHistory(agentId, prompt, content, toolCall) {
         const removed = session.history.shift();
         historyChars -= removed.user.length + removed.assistant.length;
     }
+    // Mark that system prompt has been sent for this session
+    session.systemPromptSent = true;
 }
 
 // Extract MEDIA: paths from tool results that contain screenshot paths
@@ -1338,14 +1340,16 @@ const server = http.createServer(async (req, res) => {
 
             const session = getOrCreateAgentSession(agentId);
 
-            // Build history prefix if starting fresh
+            // Build history prefix only for tool results (not full conversation history)
             let historyPrefix = '';
-            if (!session.id && session.history.length > 0) {
-                historyPrefix = '[Previous conversation]\n';
+            // Only include tool call results from previous exchanges, not the full conversation
+            if (session.history.length > 0) {
+                // Include only tool call results, not user/assistant dialogue
                 for (const exchange of session.history) {
-                    historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
+                    if (exchange.assistant && exchange.assistant.startsWith('TOOL_CALL:')) {
+                        historyPrefix += `${exchange.assistant}\n`;
+                    }
                 }
-                historyPrefix += '[Continue from here]\n\n';
             }
 
             const fullPrompt = systemPrompt
