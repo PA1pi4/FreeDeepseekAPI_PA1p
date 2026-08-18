@@ -694,6 +694,13 @@ function normalizeMessageContent(content) {
             return part.text || part.content || JSON.stringify(part);
         }).filter(Boolean).join('\n');
     }
+    // ДОБАВЛЕННАЯ ПРОВЕРКА: корректная обработка, если content пришел как единый объект
+    if (typeof content === 'object' && content !== null) {
+        if (content.type === 'text' || content.type === 'input_text' || content.type === 'output_text') {
+            return content.text || '';
+        }
+        return content.text || content.content || JSON.stringify(content);
+    }
     return String(content);
 }
 
@@ -988,9 +995,10 @@ function extractScreenshotPaths(messages) {
     const fs = require('fs');
     for (const msg of messages) {
         if (msg.role === 'tool' && msg.content) {
+            const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+            
             // Look for screenshot_path or path fields in JSON tool results
-            // These come DIRECTLY from browser_vision — always the real path
-            const pngMatch = msg.content.match(/["'](screenshot_path|path)["']\s*:\s*["']([^"']+\.(?:png|jpg|jpeg|webp|gif))["']/i);
+            const pngMatch = contentStr.match(/["'](screenshot_path|path)["']\s*:\s*["']([^"']+\.(?:png|jpg|jpeg|webp|gif))["']/i);
             if (pngMatch) {
                 const filePath = pngMatch[2];
                 if (filePath.startsWith('/') && fs.existsSync(filePath)) {
@@ -998,7 +1006,7 @@ function extractScreenshotPaths(messages) {
                 }
             }
             // Also catch plain MEDIA: tags
-            const mediaMatch = msg.content.match(/MEDIA:(\S+)/g);
+            const mediaMatch = contentStr.match(/MEDIA:(\S+)/g);
             if (mediaMatch) {
                 for (const tag of mediaMatch) {
                     const extractedPath = tag.replace(/^MEDIA:/, '');
@@ -1009,12 +1017,11 @@ function extractScreenshotPaths(messages) {
             }
         }
         // Check user/assistant messages for paths mentioned in conversation text
-        // Only include if the file ACTUALLY EXISTS (DeepSeek hallucinates paths)
         if ((msg.role === 'user' || msg.role === 'assistant') && msg.content) {
-            const content = typeof msg.content === 'string' ? msg.content : '';
+            const contentStr = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
             const pathRegex = /(\/[^\s<>"']+\.(?:png|jpg|jpeg|webp|gif))/gi;
             let match;
-            while ((match = pathRegex.exec(content)) !== null) {
+            while ((match = pathRegex.exec(contentStr)) !== null) {
                 const filePath = match[1];
                 if (filePath.startsWith('/') && fs.existsSync(filePath) && !paths.includes(`MEDIA:${filePath}`)) {
                     paths.push(`MEDIA:${filePath}`);
@@ -1025,40 +1032,192 @@ function extractScreenshotPaths(messages) {
     return paths;
 }
 
+// === Cycle Detection System ===
+const CYCLE_DETECTION_WINDOW = 6;      // Сколько последних tool_calls анализировать
+const CYCLE_THRESHOLD = 3;             // Сколько одинаковых = цикл
+const CYCLE_SIMILARITY_THRESHOLD = 0.85; // Порог схожести (0-1) для "почти одинаковых" команд
+
+/**
+ * Нормализует команду для сравнения:
+ * - убирает временные метки, GUID, числа в путях
+ * - приводит к нижнему регистру
+ * - схлопывает повторяющиеся символы
+ */
+function normalizeToolCallForComparison(toolCall) {
+    if (!toolCall || !toolCall.name) return '';
+    let args = toolCall.arguments || '{}';
+    try {
+        const parsed = JSON.parse(args);
+        // Извлекаем только "смысловые" поля (command, path, regex и т.п.)
+        const meaningful = Object.entries(parsed)
+            .filter(([key]) => !['task_progress', 'requires_approval'].includes(key))
+            .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
+            .join('|');
+        args = `${toolCall.name}:${meaningful}`;
+    } catch (e) {
+        args = `${toolCall.name}:${args}`;
+    }
+    // Нормализация: убираем числа, GUID, пути с временными метками
+    let normalized = args
+        .toLowerCase()
+        .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '<GUID>')
+        .replace(/\b\d{10,}\b/g, '<NUM>')           // длинные числа (timestamp)
+        .replace(/\b\d+\b/g, '<N>')                  // любые числа
+        .replace(/\\+/g, '/')                        // унифицируем слеши
+        .replace(/\/temp\/[^\s]+/gi, '<TEMP>')       // временные пути
+        .replace(/\s+/g, ' ')
+        .trim();
+    return normalized;
+}
+
+/**
+ * Вычисляет коэффициент схожести Жаккара между двумя строками
+ * на уровне биграмм (пар символов). Быстро и достаточно точно
+ * для выявления "почти одинаковых" команд.
+ */
+function stringSimilarity(a, b) {
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    const bigramsA = new Set();
+    const bigramsB = new Set();
+    for (let i = 0; i < a.length - 1; i++) bigramsA.add(a.substring(i, i + 2));
+    for (let i = 0; i < b.length - 1; i++) bigramsB.add(b.substring(i, i + 2));
+    if (bigramsA.size === 0 && bigramsB.size === 0) return 1;
+    let intersection = 0;
+    for (const bg of bigramsA) if (bigramsB.has(bg)) intersection++;
+    const union = bigramsA.size + bigramsB.size - intersection;
+    return union === 0 ? 0 : intersection / union;
+}
+
+/**
+ * Извлекает все tool_calls из истории сообщений
+ */
+function extractToolCallsFromHistory(messages) {
+    const calls = [];
+    for (const msg of messages) {
+        if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+            for (const tc of msg.tool_calls) {
+                if (tc.function) {
+                    calls.push({
+                        name: tc.function.name,
+                        arguments: tc.function.arguments,
+                    });
+                }
+            }
+        }
+    }
+    return calls;
+}
+
+/**
+ * Главная функция: проверяет, не зациклился ли агент.
+ * Возвращает { isCycle: boolean, pattern: string, count: number }
+ */
+function detectCycle(messages, agentTag) {
+    const allCalls = extractToolCallsFromHistory(messages);
+    if (allCalls.length < CYCLE_THRESHOLD) {
+        return { isCycle: false, pattern: '', count: 0 };
+    }
+    
+    // Берём последние N вызовов
+    const recent = allCalls.slice(-CYCLE_DETECTION_WINDOW);
+    const normalized = recent.map(normalizeToolCallForComparison);
+    
+    // Ищем повторяющиеся паттерны
+    const counts = new Map();
+    for (const norm of normalized) {
+        counts.set(norm, (counts.get(norm) || 0) + 1);
+    }
+    
+    // Проверка на точные повторы
+    for (const [pattern, count] of counts) {
+        if (count >= CYCLE_THRESHOLD) {
+            console.log(`${agentTag} ⚠️  CYCLE DETECTED: "${pattern.substring(0, 80)}..." repeated ${count} times`);
+            return { isCycle: true, pattern, count };
+        }
+    }
+    
+    // Проверка на "почти одинаковые" команды (схожесть > порога)
+    for (let i = 0; i < normalized.length; i++) {
+        let similarCount = 1;
+        for (let j = i + 1; j < normalized.length; j++) {
+            if (stringSimilarity(normalized[i], normalized[j]) >= CYCLE_SIMILARITY_THRESHOLD) {
+                similarCount++;
+            }
+        }
+        if (similarCount >= CYCLE_THRESHOLD) {
+            console.log(`${agentTag} ⚠️  NEAR-CYCLE DETECTED: ${similarCount} similar calls (threshold ${CYCLE_SIMILARITY_THRESHOLD})`);
+            return { isCycle: true, pattern: normalized[i], count: similarCount };
+        }
+    }
+    
+    return { isCycle: false, pattern: '', count: 0 };
+}
+
 function formatMessages(messages, tools) {
-    let systemPrompt = '';
+    // === ДЕТЕКЦИЯ ЦИКЛОВ ===
+    const cycleCheck = detectCycle(messages, '[cycle-detector]');
+    let cycleWarning = '';
+    
+    if (cycleCheck.isCycle) {
+        cycleWarning = `
+[CRITICAL SYSTEM WARNING — CYCLE DETECTED]
+You have executed the same (or nearly identical) tool call ${cycleCheck.count} times in a row without success.
+Pattern: ${cycleCheck.pattern.substring(0, 200)}
+
+This is a LOOP. You MUST stop and change your approach immediately:
+1. DO NOT repeat the same command or any variation of it.
+2. Analyze WHY the previous attempts failed — read the error messages carefully.
+3. Try a COMPLETELY DIFFERENT approach, tool, or command syntax.
+4. If you cannot figure out the issue, use ask_followup_question to request help from the user.
+5. If the task is impossible with current constraints, use attempt_completion to explain why.
+
+Continuing the same approach is FORBIDDEN.
+[/CRITICAL SYSTEM WARNING]
+`;
+        console.log(`[formatMessages] ⚠️  Cycle detected — injected warning into system prompt`);
+    }
+    // === КОНЕЦ ДЕТЕКЦИИ ЦИКЛОВ ===
+    
+    let systemPrompt = cycleWarning;
     for (const msg of messages) {
         if (msg.role === 'system' && msg.content) {
-            systemPrompt += msg.content + '\n';
+            systemPrompt += normalizeMessageContent(msg.content) + '\n';
         }
     }
     systemPrompt += formatToolDefinitions(tools);
-
+    
     // Build full conversation history for DeepSeek's context
     let conversation = '';
     for (const msg of messages) {
         if (msg.role === 'system') continue;  // already in systemPrompt
+        
         if (msg.role === 'user' && msg.content) {
-            conversation += `User: ${msg.content}\n\n`;
+            conversation += `User: ${normalizeMessageContent(msg.content)}\n`;
         } else if (msg.role === 'assistant') {
             if (msg.tool_calls && msg.tool_calls.length > 0) {
                 // This was a tool call response from a previous turn
                 for (const tc of msg.tool_calls) {
-                    conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n\n`;
+                    conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n`;
                 }
             } else if (msg.content) {
-                conversation += `Assistant: ${msg.content}\n\n`;
+                conversation += `Assistant: ${normalizeMessageContent(msg.content)}\n`;
             }
         } else if (msg.role === 'tool' && msg.content) {
             // Tool execution result — send back to DeepSeek as context
-            const truncated = msg.content.length > 8000
-                ? msg.content.substring(0, 8000) + '\n...[truncated]'
-                : msg.content;
-            conversation += `[Tool Result]\n${truncated}\n\n`;
+            const normalizedContent = normalizeMessageContent(msg.content);
+            const truncated = normalizedContent.length > 8000
+                ? normalizedContent.substring(0, 8000) + '\n...[truncated]'
+                : normalizedContent;
+            conversation += `[Tool Result]\n${truncated}\n`;
         }
     }
     // The last user message + full conversation context
-    return { prompt: conversation.trim(), systemPrompt: systemPrompt.trim() };
+    return { 
+        prompt: conversation.trim(), 
+        systemPrompt: systemPrompt.trim(),
+        cycleDetected: cycleCheck.isCycle
+    };
 }
 
 // === HTTP Server ===
@@ -1172,7 +1331,10 @@ const server = http.createServer(async (req, res) => {
                 ? String(requestedSession)
                 : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
             const agentTag = `[${agentId}]`;
-            const { prompt, systemPrompt } = formatMessages(messages, tools);
+            const { prompt, systemPrompt, cycleDetected } = formatMessages(messages, tools);
+            if (cycleDetected) {
+                console.log(`${agentTag} 🔄 Cycle detected — injected warning into system prompt`);
+            }
 
             const session = getOrCreateAgentSession(agentId);
 
