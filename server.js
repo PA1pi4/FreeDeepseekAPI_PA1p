@@ -1192,32 +1192,43 @@ Continuing the same approach is FORBIDDEN.
         systemPrompt += formatToolDefinitions(tools);
     }
     
-    // Build full conversation history for DeepSeek's context
+    // Build conversation context with ONLY tool results and current user query
+    // Skip intermediate assistant reasoning to reduce token usage
     let conversation = '';
+    
+    // Find the last user message (current query)
+    let lastUserMessage = '';
+    for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user' && messages[i].content) {
+            lastUserMessage = normalizeMessageContent(messages[i].content);
+            break;
+        }
+    }
+    
+    // Collect ONLY tool results from history (skip assistant reasoning)
+    const toolResults = [];
     for (const msg of messages) {
-        if (msg.role === 'system') continue;  // already in systemPrompt
-        
-        if (msg.role === 'user' && msg.content) {
-            conversation += `User: ${normalizeMessageContent(msg.content)}\n`;
-        } else if (msg.role === 'assistant') {
-            if (msg.tool_calls && msg.tool_calls.length > 0) {
-                // This was a tool call response from a previous turn
-                for (const tc of msg.tool_calls) {
-                    conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n`;
-                }
-            } else if (msg.content) {
-                conversation += `Assistant: ${normalizeMessageContent(msg.content)}\n`;
-            }
-        } else if (msg.role === 'tool' && msg.content) {
-            // Tool execution result — send back to DeepSeek as context
+        if (msg.role === 'tool' && msg.content) {
             const normalizedContent = normalizeMessageContent(msg.content);
             const truncated = normalizedContent.length > 8000
                 ? normalizedContent.substring(0, 8000) + '\n...[truncated]'
                 : normalizedContent;
-            conversation += `[Tool Result]\n${truncated}\n`;
+            toolResults.push(truncated);
         }
     }
-    // The last user message + full conversation context
+    
+    // Build context: tool results first, then current user query
+    if (toolResults.length > 0) {
+        conversation += '[Previous Tool Results]\n';
+        conversation += toolResults.join('\n\n');
+        conversation += '\n\n';
+    }
+    
+    if (lastUserMessage) {
+        conversation += `User: ${lastUserMessage}`;
+    }
+    
+    // The current user message + only tool results (no assistant reasoning)
     return { 
         prompt: conversation.trim(), 
         systemPrompt: systemPrompt.trim(),
