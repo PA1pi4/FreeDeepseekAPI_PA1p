@@ -1156,7 +1156,7 @@ function detectCycle(messages, agentTag) {
     return { isCycle: false, pattern: '', count: 0 };
 }
 
-function formatMessages(messages, tools) {
+function formatMessages(messages, tools, isFirstMessage = false) {
     // === ДЕТЕКЦИЯ ЦИКЛОВ ===
     const cycleCheck = detectCycle(messages, '[cycle-detector]');
     let cycleWarning = '';
@@ -1182,12 +1182,15 @@ Continuing the same approach is FORBIDDEN.
     // === КОНЕЦ ДЕТЕКЦИИ ЦИКЛОВ ===
     
     let systemPrompt = cycleWarning;
-    for (const msg of messages) {
-        if (msg.role === 'system' && msg.content) {
-            systemPrompt += normalizeMessageContent(msg.content) + '\n';
+    // Добавляем системный промпт только если это первое сообщение в сессии
+    if (isFirstMessage) {
+        for (const msg of messages) {
+            if (msg.role === 'system' && msg.content) {
+                systemPrompt += normalizeMessageContent(msg.content) + '\n';
+            }
         }
+        systemPrompt += formatToolDefinitions(tools);
     }
-    systemPrompt += formatToolDefinitions(tools);
     
     // Build full conversation history for DeepSeek's context
     let conversation = '';
