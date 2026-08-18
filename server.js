@@ -974,19 +974,11 @@ function sendOpenAIStream(res, openaiResp) {
 }
 
 function storeHistory(agentId, prompt, content, toolCall) {
+    // EXPERIMENTAL MODE: History storage disabled - not used for context
+    // Session history is no longer sent to DeepSeek with each message
     const session = getOrCreateAgentSession(agentId);
-    const assistantResponse = toolCall
-        ? `TOOL_CALL: ${toolCall.name}\narguments: ${toolCall.arguments}`
-        : content;
-    // Save last 500 chars of the prompt for history context
-    const shortPrompt = prompt.length > 500 ? '...' + prompt.substring(prompt.length - 500) : prompt;
-    session.history.push({ user: shortPrompt, assistant: assistantResponse });
-    while (session.history.length > MAX_HISTORY_LENGTH) session.history.shift();
-    let historyChars = session.history.reduce((sum, e) => sum + e.user.length + e.assistant.length, 0);
-    while (historyChars > MAX_HISTORY_CHARS && session.history.length > 1) {
-        const removed = session.history.shift();
-        historyChars -= removed.user.length + removed.assistant.length;
-    }
+    // Keep minimal tracking for session management but don't build context
+    session.messageCount++;
 }
 
 // Extract MEDIA: paths from tool results that contain screenshot paths
@@ -1154,7 +1146,7 @@ function detectCycle(messages, agentTag) {
     return { isCycle: false, pattern: '', count: 0 };
 }
 
-function formatMessages(messages, tools) {
+function formatMessages(messages, tools, isFirstMessage = false) {
     // === ДЕТЕКЦИЯ ЦИКЛОВ ===
     const cycleCheck = detectCycle(messages, '[cycle-detector]');
     let cycleWarning = '';
@@ -1187,32 +1179,40 @@ Continuing the same approach is FORBIDDEN.
     }
     systemPrompt += formatToolDefinitions(tools);
     
-    // Build full conversation history for DeepSeek's context
+    // EXPERIMENTAL MODE: Send only the current message, no history
+    // History and system prompt are NOT included in subsequent messages
     let conversation = '';
-    for (const msg of messages) {
-        if (msg.role === 'system') continue;  // already in systemPrompt
-        
-        if (msg.role === 'user' && msg.content) {
-            conversation += `User: ${normalizeMessageContent(msg.content)}\n`;
-        } else if (msg.role === 'assistant') {
-            if (msg.tool_calls && msg.tool_calls.length > 0) {
-                // This was a tool call response from a previous turn
-                for (const tc of msg.tool_calls) {
-                    conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n`;
+    const lastUserMsg = messages.slice().reverse().find(msg => msg.role === 'user' && msg.content);
+    
+    if (lastUserMsg) {
+        // Send ONLY the current user message, no context
+        conversation = `${normalizeMessageContent(lastUserMsg.content)}`;
+    } else {
+        // Fallback: include all non-system messages if no user message found
+        for (const msg of messages) {
+            if (msg.role === 'system') continue;
+            
+            if (msg.role === 'user' && msg.content) {
+                conversation += `User: ${normalizeMessageContent(msg.content)}\n`;
+            } else if (msg.role === 'assistant') {
+                if (msg.tool_calls && msg.tool_calls.length > 0) {
+                    for (const tc of msg.tool_calls) {
+                        conversation += `Assistant: TOOL_CALL: ${tc.function.name}\narguments: ${tc.function.arguments}\n`;
+                    }
+                } else if (msg.content) {
+                    conversation += `Assistant: ${normalizeMessageContent(msg.content)}\n`;
                 }
-            } else if (msg.content) {
-                conversation += `Assistant: ${normalizeMessageContent(msg.content)}\n`;
+            } else if (msg.role === 'tool' && msg.content) {
+                const normalizedContent = normalizeMessageContent(msg.content);
+                const truncated = normalizedContent.length > 8000
+                    ? normalizedContent.substring(0, 8000) + '\n...[truncated]'
+                    : normalizedContent;
+                conversation += `[Tool Result]\n${truncated}\n`;
             }
-        } else if (msg.role === 'tool' && msg.content) {
-            // Tool execution result — send back to DeepSeek as context
-            const normalizedContent = normalizeMessageContent(msg.content);
-            const truncated = normalizedContent.length > 8000
-                ? normalizedContent.substring(0, 8000) + '\n...[truncated]'
-                : normalizedContent;
-            conversation += `[Tool Result]\n${truncated}\n`;
         }
     }
-    // The last user message + full conversation context
+    
+    // The last user message only (no history context)
     return { 
         prompt: conversation.trim(), 
         systemPrompt: systemPrompt.trim(),
@@ -1338,19 +1338,9 @@ const server = http.createServer(async (req, res) => {
 
             const session = getOrCreateAgentSession(agentId);
 
-            // Build history prefix if starting fresh
-            let historyPrefix = '';
-            if (!session.id && session.history.length > 0) {
-                historyPrefix = '[Previous conversation]\n';
-                for (const exchange of session.history) {
-                    historyPrefix += `User: ${exchange.user}\nAssistant: ${exchange.assistant}\n\n`;
-                }
-                historyPrefix += '[Continue from here]\n\n';
-            }
-
-            const fullPrompt = systemPrompt
-                ? `${systemPrompt}\n\n${historyPrefix}${prompt}`
-                : `${historyPrefix}${prompt}`;
+            // EXPERIMENTAL MODE: No history prefix, no system prompt after first message
+            // Only the current user message is sent to DeepSeek
+            const fullPrompt = prompt;
 
             const startTime = Date.now();
             const { resp: dsResp } = await askDeepSeekStream(fullPrompt, agentId, requestedModel);

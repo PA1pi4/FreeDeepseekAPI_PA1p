@@ -1,12 +1,58 @@
+# Compiled and build artifacts
+*.pyc
+__pycache__/
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.out
+
+# Dependencies
 node_modules/
+venv/
+.venv/
 .env
+.env.local
+.env.*
+
+# Logs and temp files
 *.log
-auth.json
-deepseek-auth.json
-.chrome-profile-deepseek/
-.chrome-for-testing-profile-deepseek/
-.chrome-for-testing-profile-deepseek.stale-*/
-*.session.json
-/tmp/deepseek_response_*
+*.tmp
+*.swp
+
+# Editors
+.vscode/
+.idea/
+
+# System files
 .DS_Store
-*.pdf
+Thumbs.db
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Distribution archives
+*.tar
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.zip
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
