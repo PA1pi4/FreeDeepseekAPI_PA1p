@@ -1306,6 +1306,7 @@ const server = http.createServer(async (req, res) => {
         session.parentMessageId = null;
         session.createdAt = null;
         session.messageCount = 0;
+        session.systemPromptSent = false;  // Reset system prompt flag for new chat
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'session_reset', agent: agentId, history_preserved: historyCount, history: historyPreview }));
         return;
