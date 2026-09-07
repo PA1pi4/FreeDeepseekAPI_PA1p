@@ -10,6 +10,7 @@
  * Listens on 0.0.0.0:9655
  */
 
+const crypto = require('crypto');
 const http = require('http');
 const fs = require('fs');
 const os = require('os');
@@ -382,9 +383,10 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
     const answer = await solvePOW(challenge, account.config);
 
     if (!session.id) {
+        console.log(`\n[DEBUG] 🚀 ВЫЗОВ API: Создание новой сессии DeepSeek (/api/v0/chat_session/create)`);
         const sr = await fetch('https://chat.deepseek.com/api/v0/chat_session/create', {
             method: 'POST', headers: dsHeaders, body: '{}'
-        });
+        }); 
         const { json: sessionData, text: sessionText } = await readDeepSeekJsonResponse(sr, 'session create', account);
         const createdSessionId = sessionData?.data?.biz_data?.chat_session?.id || sessionData?.data?.biz_data?.id;
         if (!sr.ok || !createdSessionId) {
@@ -395,9 +397,9 @@ async function askDeepSeekStream(prompt, agentId, model = 'deepseek-default') {
         session.parentMessageId = null;
         session.createdAt = Date.now();
         session.messageCount = 0;
-        console.log(`${agentTag} Created new session: ${session.id}`);
+        console.log(`[DEBUG] ✅ Новая сессия DeepSeek создана. ID: ${session.id}\n`);
     } else {
-        console.log(`${agentTag} Reusing session: ${session.id} (parent: ${session.parentMessageId}, msg#${session.messageCount})`);
+        console.log(`\n[DEBUG] ⏭️ ПРОПУСК создания сессии. Переиспользуем существующую DeepSeek ID: ${session.id}\n`);
     }
 
     const powB64 = Buffer.from(JSON.stringify({
@@ -1322,10 +1324,18 @@ const server = http.createServer(async (req, res) => {
 
     let body = '';
     req.on('data', chunk => body += chunk);
-    req.on('end', async () => {
-        try {
-            const rawParams = JSON.parse(body || '{}');
-            const params = normalizeApiParams(rawParams, apiMode);
+req.on('end', async () => {
+    try {
+        const rawParams = JSON.parse(body || '{}');
+        
+        // === ГЛУБОКИЙ ДАМП ДЛЯ ПОИСКА ID ===
+        console.log('\n========================================');
+        console.log('[DUMP] Полный JSON запроса от Cline:');
+        console.log(JSON.stringify(rawParams, null, 2).substring(0, 1000)); // Первые 1000 символов
+        console.log('========================================\n');
+        // ====================================
+        
+        const params = normalizeApiParams(rawParams, apiMode);
             const messages = params.messages || [];
             const tools = params.tools || [];
             const stream = params.stream === true;
@@ -1341,17 +1351,78 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ error: { message: `${requestedModel} is not currently supported through this DeepSeek Web API path`, type: 'unsupported_model', model: requestedModel, real_model: cfg.real_model, reason: cfg.unavailable_reason, capabilities: cfg.capabilities, supported_models: SUPPORTED_MODEL_IDS } }));
                 return;
             }
-            // Use remote IP for session isolation (local gets 'dev-agent', external per-IP)
+            // Use remote IP for session isolation.
+            // To support multiple independent chats from the same client (e.g., Cline),
+            // we generate a session ID based on the first user message.
+            // ==========================================
+            // ВРЕМЕННОЕ РЕШЕНИЕ: ЯВНЫЙ ТРИГГЕР "/new"
+            // ==========================================
+            console.log(`\n========================================`);
+            console.log(`[DEBUG] Получен запрос на ${url.pathname}`);
+            
             const remoteAddr = req.socket.remoteAddress || 'unknown';
             const requestedSession = req.headers['x-agent-session'] || params.session || params.user;
-            const agentId = requestedSession
-                ? String(requestedSession)
-                : ((remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1') ? 'dev-agent' : remoteAddr);
-            const agentTag = `[${agentId}]`;
             
+            let agentId;
+            if (requestedSession) {
+                agentId = String(requestedSession);
+            } else {
+                // Базовый хэш для разделения разных проектов/контекстов
+                const firstUserMsg = messages.find(m => m.role === 'user');
+                const seed = firstUserMsg ? JSON.stringify(firstUserMsg.content).substring(0, 200) : 'empty-chat';
+                const msgHash = crypto.createHash('md5').update(seed).digest('hex').substring(0, 12);
+                const isLocal = (remoteAddr === '127.0.0.1' || remoteAddr === '::1' || remoteAddr === '::ffff:127.0.0.1');
+                agentId = isLocal ? `local_${msgHash}` : `${remoteAddr}_${msgHash}`;
+            }
+            const agentTag = `[${agentId}]`;
+
             const session = getOrCreateAgentSession(agentId);
+            
+            // 1. Находим самое последнее сообщение пользователя в текущем запросе
+            const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
+            let isNewChatRequested = false;
+
+            // 2. Проверяем наличие команды /new
+            if (lastUserMsg && typeof lastUserMsg.content === 'string') {
+                // Регулярное выражение ищет "/new" как отдельное слово (чтобы не триггерить на "renew" или "news")
+                if (/(^|\s)\/new\b/i.test(lastUserMsg.content)) {
+                    isNewChatRequested = true;
+                    console.log(`[DEBUG] 🚨 ОБНАРУЖЕН ТРИГГЕР "/new"!`);
+                    
+                    // 3. Очищаем промпт от команды "/new", чтобы модель её не видела
+                    lastUserMsg.content = lastUserMsg.content.replace(/(^|\s)\/new\b/i, '').trim();
+                    
+                    // Если после удаления промпт стал пустым, добавляем нейтральную фразу, 
+                    // иначе DeepSeek может вернуть ошибку на полностью пустой запрос
+                    if (lastUserMsg.content === '') {
+                        lastUserMsg.content = "Привет! Готов к работе.";
+                    }
+                    console.log(`[DEBUG] 🧹 Команда "/new" удалена из промпта. Очищенный промпт: "${lastUserMsg.content.substring(0, 50)}..."`);
+                }
+            }
+
+            // 4. Принудительный сброс сессии, если был триггер ИЛИ сработала резервная эвристика
+            if (isNewChatRequested || (session.messageCount >= 3 && messages.length <= 3)) {
+                console.log(`[DEBUG] 🔄 ПРИНУДИТЕЛЬНЫЙ СБРОС СЕССИИ.`);
+                console.log(`  - Причина: ${isNewChatRequested ? 'Триггер "/new"' : 'Эвристика короткой истории'}`);
+                session.id = null;
+                session.parentMessageId = null;
+                session.createdAt = null;
+                session.messageCount = 0;
+                session.systemPromptSent = false; // Важно: сбрасываем флаг, чтобы системный промпт отправился заново
+            }
+
             const isFirstMessage = !session.systemPromptSent;
+            
+            console.log(`[DEBUG] Состояние сессии в памяти прокси:`);
+            console.log(`  - session.id (DeepSeek):`, session.id || 'НЕТ (будет создан новый)');
+            console.log(`  - messageCount:`, session.messageCount);
+            console.log(`========================================\n`);
+            // ==========================================
+
+            // ⚠️ ВАЖНО: Эта строка должна быть ЗДЕСЬ, чтобы определить cycleDetected, prompt и systemPrompt
             const { prompt, systemPrompt, cycleDetected } = formatMessages(messages, tools, isFirstMessage);
+
             if (cycleDetected) {
                 console.log(`${agentTag} 🔄 Cycle detected — injected warning into system prompt`);
             }
